@@ -10,7 +10,7 @@ echo "=== Notion Sync: $TIMESTAMP ==="
 python3 "$SCRIPT_DIR/notion_sync.py" --config "$SCRIPT_DIR/config.json"
 
 # Git commit and push each workspace
-for ws_dir in "$SCRIPT_DIR"/personal "$SCRIPT_DIR"/work; do
+for ws_dir in "$SCRIPT_DIR"/valentina-hq "$SCRIPT_DIR"/writer_studio; do
     if [ ! -d "$ws_dir/.git" ]; then
         echo "Skipping $ws_dir (no git repo)"
         continue

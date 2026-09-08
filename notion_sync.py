@@ -15,6 +15,8 @@ Usage:
     python3 notion_sync.py --dry-run            # show what would be synced without writing
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
