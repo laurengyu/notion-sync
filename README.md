@@ -7,11 +7,12 @@ Built to replace Notion MCP for use with Claude Code and Claude Desktop. Sync on
 
 ## How it works
 
-1. For each root page or database in your config, the script calls the Markdown API to get the page content as markdown.
-2. It walks the block tree via the Blocks API to find child pages and databases at any nesting depth.
-3. Databases are queried through the Data Source API (2025-09-03+), with each row saved as a separate markdown file with properties as YAML frontmatter.
+1. For each root page or database in your config, the script walks the block tree via the Blocks API to discover child pages and databases at any nesting depth. This tree walk always runs, even on incremental syncs.
+2. For each discovered page, the script checks `last_edited_time` against a local manifest (`.manifest.json`). Unchanged pages are skipped entirely.
+3. Changed or new pages are pulled via the Markdown API and written to disk. Databases are queried through the Data Source API (2025-09-03+), with each row saved as a separate markdown file with properties as YAML frontmatter.
 4. Images are downloaded from Notion's pre-signed S3 URLs to a local `_images/` directory, and the markdown is rewritten to use local paths.
-5. The companion shell script runs the sync, then commits and pushes each workspace to its own Git repo.
+5. Pages present in the manifest but not encountered during the tree walk are treated as deleted in Notion -- their local files are removed.
+6. The companion shell script runs the sync, then commits and pushes each workspace to its own Git repo.
 
 
 ## Setup
@@ -79,13 +80,14 @@ git push -u origin main
 ## Usage
 
 ```
-python3 notion_sync.py                      # sync all workspaces
+python3 notion_sync.py                      # incremental sync all workspaces
+python3 notion_sync.py --full               # force full sync (ignore manifest)
 python3 notion_sync.py --workspace personal # sync one workspace
 python3 notion_sync.py --dry-run            # preview without writing files
 ./sync.sh                                   # sync + git commit + push
 ```
 
-`sync.sh` cleans each workspace directory before syncing (preserving `.git` and `.gitignore`), so the Git diff reflects the true current state of Notion -- additions, modifications, and deletions.
+Incremental sync is the default. The script only re-pulls pages whose `last_edited_time` has changed since the last run. Tree walking (discovering child pages) always runs so that new and deleted pages are detected. Use `--full` to re-pull everything, e.g. after changing the script's output format.
 
 
 ## Output structure
@@ -110,8 +112,8 @@ personal/
 
 ## Limitations
 
-- One-way sync only (Notion to local). No push-back to Notion.
-- Full pull each run, no incremental sync.
+- One-way sync only (Notion to local). No push-back to Notion (use the Markdown API directly via Claude Code for writes).
+- Tree walking (Blocks API calls to discover children) runs on every sync. Content pulls (Markdown API) are incremental.
 - Linked databases are skipped (data comes through the original database).
 - Bookmark, embed, and link preview blocks appear as `<unknown>` tags in the markdown.
 - Image URLs from Notion are temporary; the script downloads them, but if a sync fails partway through, some image links in the markdown may point to expired URLs until the next successful sync.

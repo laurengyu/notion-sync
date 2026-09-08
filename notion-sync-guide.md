@@ -117,7 +117,19 @@ Roots: 3
   [row] The Art of Statistics
   ...
 
-Done: 18 pages, 1 databases, 5 images downloaded, 0 errors
+Done: 18 updated, 0 unchanged, 1 databases, 5 images, 0 deleted, 0 errors
+```
+
+之后再次运行时，未修改的页面会被跳过：
+
+```
+[skip] 1-Projects
+  [skip] Project Alpha
+  [page] Project Beta           ← 这个改过了，重新拉取
+[skip] Notes
+  ...
+
+Done: 1 updated, 16 unchanged, 1 databases, 0 images, 0 deleted, 0 errors
 ```
 
 同步完成后，你的目录结构大概是：
@@ -161,6 +173,7 @@ cd ~/notion-sync/personal
 git init
 cat > .gitignore << 'EOF'
 .DS_Store
+.manifest.json
 EOF
 git add .
 git commit -m "Initial sync from Notion"
@@ -182,7 +195,7 @@ cd ~/notion-sync
 ```
 
 sync.sh 会：
-1. 跑 notion_sync.py 拉取两个 workspace 的最新内容
+1. 跑 notion_sync.py 增量拉取两个 workspace 的变化内容
 2. 对每个 workspace 目录做 git add、commit、push
 
 只同步某个 workspace：
@@ -195,6 +208,12 @@ python3 notion_sync.py --workspace personal
 
 ```bash
 python3 notion_sync.py --dry-run
+```
+
+强制全量重新拉取（忽略 manifest，比如改了脚本逻辑后想刷新所有文件）：
+
+```bash
+python3 notion_sync.py --full
 ```
 
 
@@ -260,8 +279,11 @@ EOF
 ## 常用命令速查
 
 ```bash
-# 同步所有 workspace
+# 增量同步所有 workspace（默认行为）
 cd ~/notion-sync && python3 notion_sync.py
+
+# 强制全量同步（忽略 manifest）
+python3 notion_sync.py --full
 
 # 只同步 personal workspace
 python3 notion_sync.py --workspace personal
