@@ -1,0 +1,22 @@
+{
+  "workspaces": [
+    {
+      "name": "personal",
+      "token": "ntn_你的_personal_workspace_token",
+      "output_dir": "./personal",
+      "roots": [
+        "https://www.notion.so/你的页面URL-1",
+        "https://www.notion.so/你的页面URL-2",
+        "https://www.notion.so/你的database-URL"
+      ]
+    },
+    {
+      "name": "work",
+      "token": "ntn_你的_work_workspace_token",
+      "output_dir": "./work",
+      "roots": [
+        "https://www.notion.so/工作页面URL"
+      ]
+    }
+  ]
+}
