@@ -1134,7 +1134,8 @@ def main():
 
     for ws in workspaces:
         name = ws["name"]
-        token = ws["token"]
+        raw = ws.get("token", "")
+        token = os.environ.get(raw.lstrip("$")) if raw.startswith("$") else raw
         roots = ws.get("roots", [])
         output_dir = ws.get("output_dir", f"./{name}")
 
