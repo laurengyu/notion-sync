@@ -321,6 +321,7 @@ class NotionSync:
         self._lock = threading.Lock()  # protects stats, manifest, synced/visited/claimed
         self._rate_limiter = TokenBucket(RATE_LIMIT_RPS)
         self._pending: list[dict] = []  # work items deferred to the concurrent fetch pass
+        self._edit_times: dict[str, str] = {}  # page_id → last_edited_time from Search prefetch
 
     def _checkpoint(self):
         """Persist the manifest periodically so an interrupted run keeps its progress."""
@@ -458,6 +459,38 @@ class NotionSync:
                 break
         return roots
 
+    def prefetch_edit_times(self):
+        """Pre-fetch last_edited_time for all pages via Search API.
+
+        Populates self._edit_times so sync_page can check whether a page
+        changed without calling get_page.  Falls back gracefully: pages not
+        in the dict still get a get_page call.
+        """
+        print("[prefetch] loading edit times via Search API...")
+        payload: dict = {"page_size": 100}
+        count = 0
+        while True:
+            data = self._request("POST", f"{API_BASE}/search", json=payload)
+            if not data:
+                break
+            for result in data.get("results", []):
+                if result.get("object") == "page":
+                    self._edit_times[result["id"]] = result.get("last_edited_time", "")
+                    count += 1
+            if data.get("has_more"):
+                payload["start_cursor"] = data["next_cursor"]
+            else:
+                break
+        print(f"[prefetch] {count} pages indexed in {len(self._edit_times)} entries")
+
+    def _get_edit_time(self, page_id: str) -> str | None:
+        """Look up a page's last_edited_time from the prefetch cache.
+
+        Returns None if the page wasn't in the Search results (new page,
+        consistency delay, etc.) — the caller should fall back to get_page.
+        """
+        return self._edit_times.get(page_id)
+
     # -- Image handling --
 
     def download_image(self, url: str) -> str | None:
@@ -585,7 +618,8 @@ class NotionSync:
         ]
         return specs, True
 
-    def _recurse_children(self, child_specs: list[dict], parent_dir: Path, depth: int):
+    def _recurse_children(self, child_specs: list[dict], parent_dir: Path, depth: int,
+                          from_cache: bool = False):
         if not child_specs:
             return
 
@@ -595,13 +629,23 @@ class NotionSync:
         page_specs = [s for s in child_specs if s.get("kind") != "database"]
         db_specs = [s for s in child_specs if s.get("kind") == "database"]
 
+        # Only trust hint_title/hint_edited_time when the child list was freshly
+        # walked from the Blocks API. Cached specs carry stale values — a child
+        # page renamed or edited since the last sync would have a new
+        # last_edited_time that the cache doesn't reflect, so we must call
+        # get_page to check.
+        def _hints(spec):
+            if from_cache:
+                return {}
+            return {"hint_title": spec.get("title"),
+                    "hint_edited_time": spec.get("last_edited_time")}
+
         if len(page_specs) > 1:
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
                 futures = {
                     pool.submit(
                         self.sync_page, spec["id"], parent_dir, depth,
-                        hint_title=spec.get("title"),
-                        hint_edited_time=spec.get("last_edited_time"),
+                        **_hints(spec),
                     ): spec
                     for spec in page_specs
                 }
@@ -615,9 +659,7 @@ class NotionSync:
                             self.stats["errors"] += 1
         else:
             for spec in page_specs:
-                self.sync_page(spec["id"], parent_dir, depth,
-                               hint_title=spec.get("title"),
-                               hint_edited_time=spec.get("last_edited_time"))
+                self.sync_page(spec["id"], parent_dir, depth, **_hints(spec))
 
         for spec in db_specs:
             self.sync_database(spec["id"], parent_dir, spec.get("title", ""), depth)
@@ -627,9 +669,11 @@ class NotionSync:
                   hint_edited_time: str | None = None):
         """Sync a single page and its children recursively.
 
-        When called from _recurse_children, hint_title and hint_edited_time
-        carry values already available from the parent's block listing, so we
-        can skip the get_page call for unchanged pages.
+        Uses three sources for last_edited_time, in priority order:
+          1. Search API prefetch cache (_edit_times) — cheapest, covers most pages
+          2. Hint from parent's freshly-walked block listing — free, but only
+             available when the parent was changed and re-walked
+          3. get_page API call — always correct, used as fallback
         """
         page_id = extract_page_id(page_id)
         with self._lock:
@@ -640,12 +684,25 @@ class NotionSync:
 
         indent = "  " * depth
 
-        # Fast path: if the parent already told us the title and edit time,
-        # check whether the page changed before spending a get_page request.
-        if hint_edited_time and hint_title and self._is_unchanged(page_id, hint_edited_time):
-            title = hint_title or "Untitled"
+        # Resolve last_edited_time without calling get_page if possible.
+        prefetched_time = self._get_edit_time(page_id)
+        edit_time = prefetched_time or hint_edited_time
+
+        if edit_time and self._is_unchanged(page_id, edit_time):
+            # Page hasn't changed — skip content fetch, reuse manifest data.
+            # We still need the title for the file path. Use hint if available,
+            # otherwise derive from the manifest's recorded path.
+            title = hint_title
+            if not title:
+                prev_path = self.manifest.get_path(page_id)
+                if prev_path:
+                    p = Path(prev_path)
+                    if p.name == "_index.md":
+                        title = p.parent.name
+                    else:
+                        title = p.stem
+            title = title or "Untitled"
             safe_title = sanitize_filename(title)
-            last_edited = hint_edited_time
 
             child_specs, _ = self._discover_children(
                 page_id, True, self.manifest.get_children(page_id))
@@ -657,15 +714,21 @@ class NotionSync:
 
             rel_path = str(file_path.relative_to(self.output_dir))
             with self._lock:
-                self._claim_path(page_id, rel_path)
-                print(f"{indent}[skip] {title}")
-                self.stats["skipped"] += 1
-                self.manifest.set(page_id, last_edited, rel_path)
-            self._checkpoint()
-            self._recurse_children(child_specs, parent_dir / safe_title, depth + 1)
-            return
+                needs_refetch = self._claim_path(page_id, rel_path)
+            if needs_refetch:
+                pass  # fall through to full path below
+            else:
+                with self._lock:
+                    print(f"{indent}[skip] {title}")
+                    self.stats["skipped"] += 1
+                    self.manifest.set(page_id, edit_time, rel_path)
+                self._checkpoint()
+                self._recurse_children(child_specs, parent_dir / safe_title, depth + 1,
+                                       from_cache=True)
+                return
 
-        # Full path: fetch page metadata (needed for properties / frontmatter)
+        # Full path: fetch page metadata (needed for properties / frontmatter).
+        # Reached when the page changed, is new, or the local file is missing.
         page = self.get_page(page_id)
         if not page:
             return
@@ -698,9 +761,9 @@ class NotionSync:
 
         rel_path = str(file_path.relative_to(self.output_dir))
         with self._lock:
-            self._claim_path(page_id, rel_path)
+            needs_refetch = self._claim_path(page_id, rel_path)
 
-            if unchanged:
+            if unchanged and not needs_refetch:
                 print(f"{indent}[skip] {title}")
                 self.stats["skipped"] += 1
                 self.manifest.set(page_id, last_edited, rel_path, children_to_store)
@@ -719,7 +782,8 @@ class NotionSync:
         self._checkpoint()
 
         # Always recurse into children
-        self._recurse_children(child_specs, parent_dir / safe_title, depth + 1)
+        self._recurse_children(child_specs, parent_dir / safe_title, depth + 1,
+                               from_cache=not walked)
 
     def sync_database(self, database_id: str, parent_dir: Path, title: str = "", depth: int = 0):
         """Sync a database: create a directory, each row becomes a markdown file."""
@@ -789,9 +853,9 @@ class NotionSync:
                 file_path = db_dir / f"{safe_row_title}.md"
 
             rel_path = str(file_path.relative_to(self.output_dir))
-            self._claim_path(row_id, rel_path)
+            needs_refetch = self._claim_path(row_id, rel_path)
 
-            if unchanged:
+            if unchanged and not needs_refetch:
                 print(f"{indent}  [skip] {row_title}")
                 self.stats["skipped"] += 1
                 self.manifest.set(row_id, last_edited, rel_path, children_to_store)
@@ -808,7 +872,8 @@ class NotionSync:
                 })
 
             self._checkpoint()
-            self._recurse_children(child_specs, db_dir / safe_row_title, depth + 2)
+            self._recurse_children(child_specs, db_dir / safe_row_title, depth + 2,
+                                   from_cache=not walked)
 
         self.stats["databases"] += 1
 
@@ -906,20 +971,50 @@ class NotionSync:
                 break
             parent = parent.parent
 
-    def _claim_path(self, page_id: str, rel_path: str):
-        """Record this page's current file path, and delete a stale file it left
-        at a previous path.
+    def _claim_path(self, page_id: str, rel_path: str) -> bool:
+        """Record this page's current file path and handle stale files.
 
-        A page that was moved or renamed in Notion (or that gained/lost children,
-        switching between ``X.md`` and ``X/_index.md``) is written to its new
-        path but keeps the same id, so deletion detection never touches the old
-        file. Compare against the path recorded last run and remove it here.
+        Returns True if the file at rel_path is missing and needs a re-fetch
+        (the old file was already gone, or the path changed and move failed).
         """
+        needs_refetch = False
         prev_path = self.manifest.get_path(page_id)
         if (prev_path and prev_path != rel_path
                 and prev_path not in self.claimed_paths):
-            self._remove_local_file(prev_path, "moved")
+            moved = self._move_local_file(prev_path, rel_path)
+            if not moved:
+                needs_refetch = True
+        elif not (self.output_dir / rel_path).exists():
+            needs_refetch = True
         self.claimed_paths.add(rel_path)
+        return needs_refetch
+
+    def _move_local_file(self, old_rel: str, new_rel: str) -> bool:
+        """Move a tracked local file to a new path, pruning empty parents.
+
+        Returns True if the file was moved, False if the source was missing.
+        """
+        if self.dry_run:
+            return True
+        old_path = self.output_dir / old_rel
+        new_path = self.output_dir / new_rel
+        moved = False
+        if old_path.exists():
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            old_path.rename(new_path)
+            print(f"[moved] {old_rel} → {new_rel}")
+            moved = True
+        else:
+            print(f"[moved] {old_rel} → {new_rel} (source missing, will re-fetch)")
+        # Prune empty parent dirs left behind
+        parent = old_path.parent
+        while parent != self.output_dir:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+        return moved
 
     def _cleanup_deleted(self):
         """Remove local files for pages that no longer exist in Notion."""
@@ -975,7 +1070,11 @@ class NotionSync:
         for sig in (signal.SIGINT, signal.SIGTERM):
             old_handlers[sig] = signal.signal(sig, _save_and_exit)
         try:
-            # Pass 1: discover tree structure (serial)
+            # Pre-fetch edit times so Pass 1 can skip get_page for unchanged pages
+            if not self.full:
+                self.prefetch_edit_times()
+
+            # Pass 1: discover tree structure
             for rid, _ in resolved:
                 self.detect_and_sync(rid, self.output_dir)
 
@@ -1016,7 +1115,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show what would be synced")
     parser.add_argument("--full", action="store_true",
                         help="Force full sync, ignoring manifest (re-pull everything)")
+    parser.add_argument("--wait", type=int, default=0, metavar="SECONDS",
+                        help="Wait before syncing (e.g. --wait 45 after a recent edit)")
     args = parser.parse_args()
+
+    if args.wait > 0:
+        print(f"Waiting {args.wait}s for Notion to index recent changes...")
+        time.sleep(args.wait)
 
     config = load_config(args.config)
     workspaces = config.get("workspaces", [])

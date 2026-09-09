@@ -129,13 +129,16 @@ Root pages (3):
 Done: 18 updated, 0 unchanged, 1 databases, 5 images, 0 deleted, 0 errors
 ```
 
-脚本分两个阶段工作：
-1. **Pass 1（发现）**：串行遍历整棵树，找到所有页面和数据库行，把需要拉内容的加入队列
-2. **Pass 2（拉取）**：用 3 个线程并发拉取 Markdown 内容、下载图片、写文件
+脚本分三个阶段工作：
+1. **Prefetch（预取）**：通过 Search API 批量获取所有页面的 `last_edited_time`（约 16 次请求），建立内存缓存。增量同步时大多数页面可以直接通过缓存判断是否有变化，无需逐页调用 API。`--full` 模式跳过此阶段。
+2. **Pass 1（发现）**：遍历整棵树，找到所有页面和数据库行。对每个页面，先查 prefetch 缓存 → 再看父页面的 hint → 最后才调用 get_page（仅用于 Search 尚未索引的新页面）。把需要拉内容的加入队列。
+3. **Pass 2（拉取）**：用 3 个线程并发拉取 Markdown 内容、下载图片、写文件
 
-之后再次运行时，未修改的页面会被跳过：
+之后再次运行时，prefetch 缓存判断大多数页面无变化，直接跳过：
 
 ```
+[prefetch] fetched edit times for 1596 pages (16 requests)
+
 [skip] 1-Projects
   [skip] Project Alpha
   [page] Project Beta           ← 这个改过了，加入队列
@@ -213,6 +216,12 @@ sync.sh 会：
 1. 跑 notion_sync.py 增量拉取变化内容（并发 + 自适应限速）
 2. 对每个 workspace 目录做 git add、commit、push
 
+刚在 Notion 里改完东西，想立刻同步？加 `--wait` 等待 Search API 索引完成：
+
+```bash
+python3 notion_sync.py --wait 45
+```
+
 只同步某个 workspace：
 
 ```bash
@@ -278,12 +287,12 @@ EOF
 
 ## 性能
 
-脚本使用两阶段架构 + 3 线程并发 + 自适应限速器（默认 4 req/s，遇到 429 自动降速，成功后恢复）。
+脚本使用 Search API 预取 + 三阶段架构 + 3 线程并发 + 自适应限速器（默认 4 req/s，遇到 429 自动降速，成功后恢复）。增量同步时，Search API 批量获取所有页面的编辑时间（约 16 次请求），绝大多数页面无需单独调用 API 即可判断是否有变化。
 
 粗略估算（~1600 页的 workspace）：
 - 首次全量同步：~4500 次 API 请求，约 20-25 分钟
-- 增量同步（无变化）：~1600 次请求（只查元数据），约 7 分钟
-- 增量同步（少量变化）：和上面差不多，每个变化的页面多 1 次请求
+- 增量同步（无变化）：~140 次请求（Search 预取 + 数据库查询），约 1 分钟
+- 增量同步（少量变化）：~150 次请求，约 1 分钟
 
 Manifest 每 20 秒自动保存一次，Ctrl-C 中断时也会保存，下次从中断处继续。
 
@@ -309,7 +318,10 @@ Manifest 每 20 秒自动保存一次，Ctrl-C 中断时也会保存，下次从
 # 增量同步所有 workspace（默认行为）
 cd ~/notion-sync && python3 notion_sync.py
 
-# 强制全量同步（忽略 manifest）
+# 刚改完 Notion，等待 Search API 索引后再同步
+python3 notion_sync.py --wait 45
+
+# 强制全量同步（忽略 manifest，跳过 prefetch）
 python3 notion_sync.py --full
 
 # 只同步 personal workspace

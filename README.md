@@ -7,13 +7,15 @@ Built to replace Notion MCP for use with Claude Code and Claude Desktop. Sync on
 
 ## How it works
 
-The sync runs in two passes:
+The sync runs in three phases:
 
-**Pass 1 — Discover tree structure.** For each root page or database, the script walks the block tree via the Blocks API to discover child pages and databases at any nesting depth. Sibling pages are explored concurrently (3 workers). On incremental syncs this walk is skipped for pages and database rows whose `last_edited_time` is unchanged -- their child list is reused from the manifest, since adding or removing a child would have bumped that timestamp. When a parent's block listing already carries a child page's title and edit time, unchanged children skip the `get_page` call entirely. Changed pages are queued for content fetching. Databases are fully queried every run so new and deleted rows are always detected.
+**Prefetch.** On incremental syncs, the script calls the Search API to bulk-fetch `last_edited_time` for all pages (~16 requests for a 1600-page workspace). This builds an in-memory lookup so most pages can be checked for changes without individual API calls. Skipped on `--full`.
+
+**Pass 1 — Discover tree structure.** For each root page or database, the script walks the block tree via the Blocks API to discover child pages and databases at any nesting depth. Sibling pages are explored concurrently (3 workers). For each discovered page, the script checks its `last_edited_time` against the manifest -- first from the prefetch cache, then from parent hints, falling back to a `get_page` call only when neither is available (e.g. newly created pages not yet indexed by Search). Unchanged pages reuse their cached child list from the manifest. Changed pages are queued for content fetching. Databases are fully queried every run so new and deleted rows are always detected.
 
 **Pass 2 — Fetch content concurrently.** All queued pages are processed in parallel (3 workers) -- fetching markdown, downloading images, and writing files. An adaptive token-bucket rate limiter (default 4 req/s) is shared across all threads: it backs off on 429s and recovers after successful requests.
 
-**Cleanup.** Pages present in the manifest but not encountered during the tree walk are treated as deleted in Notion -- their local files are removed. A page that moved or was renamed keeps its ID but resolves to a new path; the script deletes the stale file at the old location and prunes any directory left empty.
+**Cleanup.** Pages present in the manifest but not encountered during the tree walk are treated as deleted in Notion -- their local files are removed. A page that moved or was renamed keeps its ID but resolves to a new path; the script moves the file to its new location (or re-fetches it if the old file is missing) and prunes any directory left empty.
 
 The companion shell script runs the sync, then commits and pushes each workspace to its own Git repo.
 
@@ -86,13 +88,14 @@ git push -u origin main
 
 ```
 python3 notion_sync.py                      # incremental sync all workspaces
+python3 notion_sync.py --wait 45            # wait 45s for Search API to index recent edits
 python3 notion_sync.py --full               # force full sync (ignore manifest)
 python3 notion_sync.py --workspace personal # sync one workspace
 python3 notion_sync.py --dry-run            # preview without writing files
 ./sync.sh                                   # sync + git commit + push
 ```
 
-Incremental sync is the default. The script only re-pulls pages whose `last_edited_time` has changed since the last run. Tree walking (discovering child pages) always runs so that new and deleted pages are detected, but unchanged pages reuse their cached child list and skip the `get_page` call when the parent already provided their edit time. Use `--full` to re-pull everything, e.g. after changing the script's output format.
+Incremental sync is the default. The script pre-fetches `last_edited_time` for all pages via the Search API, then only re-pulls pages that have changed. Use `--wait 45` when syncing right after making changes in Notion -- the Search API has a few seconds of indexing delay, and the wait ensures recent edits are picked up. Use `--full` to re-pull everything, e.g. after changing the script's output format.
 
 
 ## Output structure
@@ -117,18 +120,19 @@ personal/
 
 ## Performance
 
-The script uses a two-pass architecture with concurrent fetching (3 workers) and an adaptive rate limiter (4 req/s, shared across threads). On an incremental sync with few changes, most pages are skipped after a single metadata check. The manifest is checkpointed every 20 seconds and saved on interrupt (Ctrl-C / SIGTERM), so a partial run's progress is preserved.
+The script uses Search API prefetching, a two-pass architecture with concurrent fetching (3 workers), and an adaptive rate limiter (4 req/s, shared across threads). On incremental syncs, the Search API bulk-fetches edit times for all pages in ~16 requests, so most pages can be skipped without individual API calls. The manifest is checkpointed every 20 seconds and saved on interrupt (Ctrl-C / SIGTERM), so a partial run's progress is preserved.
 
 Rough estimates for a ~1600-page workspace:
 - Initial full sync: ~4500 API requests, ~20-25 minutes
-- Incremental sync (nothing changed): ~1600 requests (metadata only), ~7 minutes
-- Incremental sync (a few pages changed): similar to above plus ~1 request per changed page
+- Incremental sync (nothing changed): ~140 requests (Search prefetch + database queries), ~1 minute
+- Incremental sync (a few pages changed): ~150 requests, ~1 minute
 
 
 ## Limitations
 
 - One-way sync only (Notion to local). No push-back to Notion (use the Markdown API directly via Claude Code for writes).
-- Tree walking (Blocks API calls to discover children) is incremental: it runs only for changed pages/rows and for anything new. Content pulls (Markdown API) are incremental too. Moves and renames are handled (the stale file at the old path is removed), but if Notion does not bump a page's `last_edited_time` when a child is moved *out* of it, that page keeps a stale cached child list until the next `--full` sync -- so run `--full` occasionally after a big reorganization.
+- The Search API has a few seconds of indexing delay. If you sync immediately after editing in Notion, use `--wait 45` to ensure the change is picked up. Without `--wait`, changes made in the last few seconds may be missed until the next sync.
+- Tree walking (Blocks API calls to discover children) is incremental: it runs only for changed pages/rows and for anything new. Content pulls (Markdown API) are incremental too. Moves and renames are handled (the file is moved to its new path), but if Notion does not bump a page's `last_edited_time` when a child is moved *out* of it, that page keeps a stale cached child list until the next `--full` sync -- so run `--full` occasionally after a big reorganization.
 - Linked databases are skipped (data comes through the original database).
 - Bookmark, embed, and link preview blocks appear as `<unknown>` tags in the markdown.
 - Image URLs from Notion are temporary; the script downloads them, but if a sync fails partway through, some image links in the markdown may point to expired URLs until the next successful sync.
