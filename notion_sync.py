@@ -316,6 +316,7 @@ class NotionSync:
         self.manifest = Manifest(self.output_dir)
         self.stats = {"pages": 0, "skipped": 0, "databases": 0,
                       "images": 0, "deleted": 0, "errors": 0}
+        self.changes: list[tuple[str, str]] = []  # (tag, description)
         self._checkpoint_interval = 20.0  # seconds between incremental manifest saves
         self._last_checkpoint = time.time()
         self._lock = threading.Lock()  # protects stats, manifest, synced/visited/claimed
@@ -912,6 +913,7 @@ class NotionSync:
             self.manifest.set(page_id, item["last_edited"], item["rel_path"],
                               item["children_to_store"])
             self.stats["pages"] += 1
+            self.changes.append(("updated", item["rel_path"]))
 
         self._checkpoint()
 
@@ -963,6 +965,8 @@ class NotionSync:
             full_path.unlink()
             print(f"[{reason}] {rel_path}")
             self.stats["deleted"] += 1
+            with self._lock:
+                self.changes.append(("deleted", rel_path))
         parent = full_path.parent
         while parent != self.output_dir:
             try:
@@ -1004,6 +1008,8 @@ class NotionSync:
             old_path.rename(new_path)
             print(f"[moved] {old_rel} → {new_rel}")
             moved = True
+            with self._lock:
+                self.changes.append(("moved", f"{old_rel} → {new_rel}"))
         else:
             print(f"[moved] {old_rel} → {new_rel} (source missing, will re-fetch)")
         # Prune empty parent dirs left behind
@@ -1088,6 +1094,13 @@ class NotionSync:
         finally:
             for sig, handler in old_handlers.items():
                 signal.signal(sig, handler)
+
+        if self.changes:
+            order = {"updated": 0, "moved": 1, "deleted": 2}
+            self.changes.sort(key=lambda c: (order.get(c[0], 9), c[1]))
+            print("\nChanges:")
+            for tag, desc in self.changes:
+                print(f"  [{tag}] {desc}")
 
         print(f"\nDone: {self.stats['pages']} updated, {self.stats['skipped']} unchanged, "
               f"{self.stats['databases']} databases, {self.stats['images']} images, "
