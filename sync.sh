@@ -7,7 +7,7 @@ TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 echo "=== Notion Sync: $TIMESTAMP ==="
 
 # Run the Python sync script (incremental by default)
-python3 "$SCRIPT_DIR/notion_sync.py" --config "$SCRIPT_DIR/config.json"
+python3 "$SCRIPT_DIR/notion_sync.py" --wait 45 --config "$SCRIPT_DIR/config.json"
 
 # Git commit and push each workspace.
 # Output dirs are read from config.json so this never drifts from the real config.

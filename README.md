@@ -92,7 +92,7 @@ python3 notion_sync.py --wait 45            # wait 45s for Search API to index r
 python3 notion_sync.py --full               # force full sync (ignore manifest)
 python3 notion_sync.py --workspace personal # sync one workspace
 python3 notion_sync.py --dry-run            # preview without writing files
-./sync.sh                                   # sync + git commit + push
+./sync.sh                                   # sync (with 45s wait) + git commit + push
 ```
 
 Incremental sync is the default. The script pre-fetches `last_edited_time` for all pages via the Search API, then only re-pulls pages that have changed. Use `--wait 45` when syncing right after making changes in Notion -- the Search API has a few seconds of indexing delay, and the wait ensures recent edits are picked up. Use `--full` to re-pull everything, e.g. after changing the script's output format.

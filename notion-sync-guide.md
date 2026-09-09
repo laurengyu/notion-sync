@@ -213,10 +213,11 @@ cd ~/notion-sync
 ```
 
 sync.sh 会：
-1. 跑 notion_sync.py 增量拉取变化内容（并发 + 自适应限速）
-2. 对每个 workspace 目录做 git add、commit、push
+1. 等待 45 秒（`--wait 45`），确保 Search API 索引到最近的改动
+2. 跑 notion_sync.py 增量拉取变化内容（并发 + 自适应限速）
+3. 对每个 workspace 目录做 git add、commit、push
 
-刚在 Notion 里改完东西，想立刻同步？加 `--wait` 等待 Search API 索引完成：
+如果不需要 git push，也可以直接跑脚本：
 
 ```bash
 python3 notion_sync.py --wait 45
