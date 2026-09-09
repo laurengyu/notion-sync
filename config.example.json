@@ -2,21 +2,18 @@
   "workspaces": [
     {
       "name": "personal",
-      "token": "ntn_你的_personal_workspace_token",
+      "token": "ntn_your_personal_workspace_token",
       "output_dir": "./personal",
       "roots": [
-        "https://www.notion.so/你的页面URL-1",
-        "https://www.notion.so/你的页面URL-2",
-        "https://www.notion.so/你的database-URL"
+        "https://www.notion.so/your-page-URL-1",
+        "https://www.notion.so/your-page-URL-2",
+        "https://www.notion.so/your-database-URL"
       ]
     },
     {
       "name": "work",
-      "token": "ntn_你的_work_workspace_token",
-      "output_dir": "./work",
-      "roots": [
-        "https://www.notion.so/工作页面URL"
-      ]
+      "token": "ntn_your_work_workspace_token",
+      "output_dir": "./work"
     }
   ]
 }

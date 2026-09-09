@@ -5,7 +5,9 @@ notion_sync.py — Pull Notion pages and databases to local markdown files.
 Uses the Notion Markdown API (2026-03-11) for page content,
 the Blocks API for child discovery, and the Databases API for row queries.
 Downloads images to a local _images/ directory and rewrites URLs.
-Incremental by default: only re-pulls pages whose last_edited_time has changed.
+Incremental by default: only re-pulls pages whose last_edited_time has changed,
+and only walks the block tree for pages/rows that changed (unchanged subtrees
+reuse the child list recorded in the manifest).
 
 Usage:
     python3 notion_sync.py                      # incremental sync all workspaces
@@ -22,8 +24,11 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -37,8 +42,56 @@ import requests
 DEFAULT_CONFIG = "config.json"
 API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2026-03-11"
-RATE_LIMIT_DELAY = 0.35  # seconds between requests (~3 req/s)
+RATE_LIMIT_DELAY = 0.2  # seconds between requests; 429s are retried with backoff
 MANIFEST_FILE = ".manifest.json"
+MAX_WORKERS = 3
+RATE_LIMIT_RPS = 4  # max requests per second across all threads
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+class TokenBucket:
+    """Token-bucket rate limiter with adaptive throttling, safe across threads."""
+
+    def __init__(self, rate: float, min_rate: float = 1.0):
+        self._initial_rate = rate
+        self._min_rate = min_rate
+        self._rate = rate
+        self._capacity = rate
+        self._tokens = rate
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self._capacity,
+                                   self._tokens + (now - self._last) * self._rate)
+                self._last = now
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return
+                wait = (1 - self._tokens) / self._rate
+            time.sleep(wait)
+
+    def throttle(self):
+        """Reduce rate by 25% after a 429. Called by _request on rate-limit hits."""
+        with self._lock:
+            new_rate = max(self._min_rate, self._rate * 0.75)
+            if new_rate < self._rate:
+                self._rate = new_rate
+                self._capacity = new_rate
+                print(f"  [throttle] reduced to {self._rate:.1f} req/s")
+
+    def recover(self):
+        """Nudge rate back up by 10% after a successful request."""
+        with self._lock:
+            if self._rate < self._initial_rate:
+                self._rate = min(self._initial_rate, self._rate * 1.1)
+                self._capacity = self._rate
 
 
 # ---------------------------------------------------------------------------
@@ -188,23 +241,49 @@ class Manifest:
                 self.data = {}
 
     def save(self):
+        """Write the manifest atomically so an interrupted run can't corrupt it."""
         self.file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.file, "w") as f:
+        tmp = self.file.with_name(self.file.name + ".tmp")
+        with open(tmp, "w") as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
+        tmp.replace(self.file)
 
     def get_edited_time(self, page_id: str) -> str | None:
         entry = self.data.get(page_id)
-        return entry["last_edited_time"] if entry else None
+        return entry.get("last_edited_time") if entry else None
 
     def get_path(self, page_id: str) -> str | None:
         entry = self.data.get(page_id)
-        return entry["path"] if entry else None
+        return entry.get("path") if entry else None
 
-    def set(self, page_id: str, last_edited_time: str, path: str):
-        self.data[page_id] = {
+    def is_linked_database(self, database_id: str) -> bool:
+        """True if a past sync determined this database is a linked view (unqueryable)."""
+        entry = self.data.get(database_id)
+        return bool(entry and entry.get("linked_database"))
+
+    def mark_linked_database(self, database_id: str):
+        self.data[database_id] = {"linked_database": True}
+
+    def get_children(self, page_id: str) -> list[dict] | None:
+        """Child page/database specs recorded on the last sync, or None if unknown."""
+        entry = self.data.get(page_id)
+        return entry.get("children") if entry else None
+
+    def set(self, page_id: str, last_edited_time: str, path: str,
+            children: list[dict] | None = None):
+        entry = {
             "last_edited_time": last_edited_time,
             "path": path,
         }
+        if children is not None:
+            entry["children"] = children
+        else:
+            # Preserve a previously recorded child list when the caller
+            # skipped the tree walk this run.
+            prev = self.data.get(page_id)
+            if prev and "children" in prev:
+                entry["children"] = prev["children"]
+        self.data[page_id] = entry
 
     def all_ids(self) -> set[str]:
         return set(self.data.keys())
@@ -233,30 +312,55 @@ class NotionSync:
         })
         self.synced_ids = set()  # avoid infinite loops on linked pages
         self.visited_ids = set()  # track all ids seen this run (for deletion)
+        self.claimed_paths = set()  # rel paths written/claimed this run (move cleanup)
         self.manifest = Manifest(self.output_dir)
         self.stats = {"pages": 0, "skipped": 0, "databases": 0,
                       "images": 0, "deleted": 0, "errors": 0}
+        self._checkpoint_interval = 20.0  # seconds between incremental manifest saves
+        self._last_checkpoint = time.time()
+        self._lock = threading.Lock()  # protects stats, manifest, synced/visited/claimed
+        self._rate_limiter = TokenBucket(RATE_LIMIT_RPS)
+        self._pending: list[dict] = []  # work items deferred to the concurrent fetch pass
+
+    def _checkpoint(self):
+        """Persist the manifest periodically so an interrupted run keeps its progress."""
+        if self.dry_run:
+            return
+        now = time.time()
+        with self._lock:
+            if now - self._last_checkpoint >= self._checkpoint_interval:
+                self.manifest.save()
+                self._last_checkpoint = now
 
     def _request(self, method: str, url: str, **kwargs) -> dict | None:
-        """Make an API request with rate limiting and error handling."""
-        time.sleep(RATE_LIMIT_DELAY)
-        try:
-            resp = self.session.request(method, url, **kwargs)
-            if resp.status_code == 429:
-                retry_after = float(resp.headers.get("Retry-After", 2))
-                print(f"  [rate limited] waiting {retry_after}s...")
-                time.sleep(retry_after)
+        """Make an API request with adaptive rate limiting and error handling."""
+        for attempt in range(5):
+            self._rate_limiter.acquire()
+            try:
                 resp = self.session.request(method, url, **kwargs)
-            if resp.status_code == 404:
-                print(f"  [404] not found: {url}")
-                self.stats["errors"] += 1
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("Retry-After", 2))
+                    self._rate_limiter.throttle()
+                    print(f"  [rate limited] waiting {retry_after}s (attempt {attempt + 1}/5)...")
+                    time.sleep(retry_after)
+                    continue
+                if resp.status_code == 404:
+                    print(f"  [404] not found: {url}")
+                    with self._lock:
+                        self.stats["errors"] += 1
+                    return None
+                resp.raise_for_status()
+                self._rate_limiter.recover()
+                return resp.json()
+            except requests.RequestException as e:
+                print(f"  [error] {e}")
+                with self._lock:
+                    self.stats["errors"] += 1
                 return None
-            resp.raise_for_status()
-            return resp.json()
-        except requests.RequestException as e:
-            print(f"  [error] {e}")
+        print(f"  [error] gave up after repeated rate limiting: {url}")
+        with self._lock:
             self.stats["errors"] += 1
-            return None
+        return None
 
     # -- API calls --
 
@@ -299,17 +403,18 @@ class NotionSync:
         data_sources = db.get("data_sources", [])
         if data_sources:
             ds_id = data_sources[0]["id"]
-            return self._query_endpoint(f"{API_BASE}/data_sources/{ds_id}/query")
+            return self._query_endpoint(f"{API_BASE}/data_sources/{ds_id}/query") or []
 
         # Fallback: try using database_id as data_source_id directly
         rows = self._query_endpoint(f"{API_BASE}/data_sources/{database_id}/query")
         if rows is not None:
             return rows
 
-        # If we get here, it's probably a linked database
-        is_linked = db.get("is_inline") is False or "linked" in str(db.get("parent", {}))
+        # If we get here, it's probably a linked database. Record that so future
+        # syncs skip it up front instead of repeating these failing requests.
         print(f"  [skip] could not query database {database_id} — likely a linked database.")
         print(f"         Linked databases must be queried via their original source.")
+        self.manifest.mark_linked_database(database_id)
         return []
 
     def _query_endpoint(self, url: str) -> list[dict] | None:
@@ -331,6 +436,27 @@ class NotionSync:
 
     def get_database_metadata(self, database_id: str) -> dict | None:
         return self._request("GET", f"{API_BASE}/databases/{database_id}")
+
+    def search_root_pages(self) -> list[dict]:
+        """Discover all workspace-level pages and databases via the Search API."""
+        roots = []
+        payload = {
+            "filter": {"property": "object", "value": "page"},
+            "page_size": 100,
+        }
+        while True:
+            data = self._request("POST", f"{API_BASE}/search", json=payload)
+            if not data:
+                break
+            for result in data.get("results", []):
+                parent = result.get("parent", {})
+                if parent.get("type") == "workspace":
+                    roots.append(result)
+            if data.get("has_more"):
+                payload["start_cursor"] = data["next_cursor"]
+            else:
+                break
+        return roots
 
     # -- Image handling --
 
@@ -354,7 +480,6 @@ class NotionSync:
                 return f"_images/{filename}"
 
             self.images_dir.mkdir(parents=True, exist_ok=True)
-            time.sleep(RATE_LIMIT_DELAY)
             # Use plain requests (no Notion auth headers) — S3 pre-signed
             # URLs already contain auth via query params and reject extra
             # Authorization headers with 400.
@@ -370,16 +495,29 @@ class NotionSync:
             return None
 
     def process_images_in_markdown(self, markdown: str) -> str:
-        """Find image URLs in markdown, download them, replace with local paths."""
+        """Find image URLs in markdown, download them concurrently, replace with local paths."""
+        matches = list(re.finditer(r"!\[([^\]]*)\]\(([^)]+)\)", markdown))
+        if not matches:
+            return markdown
+
+        remote = [(m, m.group(2)) for m in matches
+                  if not m.group(2).startswith(("_images/", "./"))]
+        if not remote:
+            return markdown
+
+        url_to_local: dict[str, str | None] = {}
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {pool.submit(self.download_image, url): url
+                       for _, url in remote}
+            for fut in as_completed(futures):
+                url_to_local[futures[fut]] = fut.result()
+
         def replace_image(match):
-            alt = match.group(1)
             url = match.group(2)
-            if url.startswith("_images/") or url.startswith("./"):
-                return match.group(0)  # already local
-            local = self.download_image(url)
+            local = url_to_local.get(url)
             if local:
-                return f"![{alt}]({local})"
-            return match.group(0)  # keep original if download failed
+                return f"![{match.group(1)}]({local})"
+            return match.group(0)
 
         return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_image, markdown)
 
@@ -419,17 +557,115 @@ class NotionSync:
 
         return child_pages, child_dbs
 
-    def sync_page(self, page_id: str, parent_dir: Path, depth: int = 0):
-        """Sync a single page and its children recursively."""
-        page_id = extract_page_id(page_id)
-        if page_id in self.synced_ids:
+    def _discover_children(self, block_id: str, unchanged: bool,
+                           cached: list[dict] | None) -> tuple[list[dict], bool]:
+        """Return (child_specs, walked).
+
+        child_specs is a list of {"id", "kind"[, "title"]} dicts for the child
+        pages and databases directly under this page/row. When the page is
+        unchanged and a child list was recorded on a previous sync, trust it and
+        skip the Blocks API tree walk: adding or removing a child edits the page
+        and would have bumped its last_edited_time, so an unchanged page's
+        children are exactly what they were last run. This saves one Blocks API
+        call per unchanged page — and, crucially, per unchanged database row.
+        """
+        if unchanged and cached is not None:
+            return cached, False
+        child_pages, child_dbs = self._find_child_pages_and_dbs(block_id)
+        specs = [
+            {"id": b["id"], "kind": "page",
+             "title": b.get("child_page", {}).get("title", "Untitled"),
+             "last_edited_time": b.get("last_edited_time", "")}
+            for b in child_pages
+        ]
+        specs += [
+            {"id": b["id"], "kind": "database",
+             "title": b.get("child_database", {}).get("title", "Untitled Database")}
+            for b in child_dbs
+        ]
+        return specs, True
+
+    def _recurse_children(self, child_specs: list[dict], parent_dir: Path, depth: int):
+        if not child_specs:
             return
-        self.synced_ids.add(page_id)
-        self.visited_ids.add(page_id)
+
+        # Databases are kept serial — they have their own internal concurrency.
+        # Sibling pages are explored concurrently so their get_page /
+        # get_block_children calls overlap instead of waiting in sequence.
+        page_specs = [s for s in child_specs if s.get("kind") != "database"]
+        db_specs = [s for s in child_specs if s.get("kind") == "database"]
+
+        if len(page_specs) > 1:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                futures = {
+                    pool.submit(
+                        self.sync_page, spec["id"], parent_dir, depth,
+                        hint_title=spec.get("title"),
+                        hint_edited_time=spec.get("last_edited_time"),
+                    ): spec
+                    for spec in page_specs
+                }
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        spec = futures[fut]
+                        print(f"  [error] sync_page failed for {spec['id']}: {e}")
+                        with self._lock:
+                            self.stats["errors"] += 1
+        else:
+            for spec in page_specs:
+                self.sync_page(spec["id"], parent_dir, depth,
+                               hint_title=spec.get("title"),
+                               hint_edited_time=spec.get("last_edited_time"))
+
+        for spec in db_specs:
+            self.sync_database(spec["id"], parent_dir, spec.get("title", ""), depth)
+
+    def sync_page(self, page_id: str, parent_dir: Path, depth: int = 0,
+                  hint_title: str | None = None,
+                  hint_edited_time: str | None = None):
+        """Sync a single page and its children recursively.
+
+        When called from _recurse_children, hint_title and hint_edited_time
+        carry values already available from the parent's block listing, so we
+        can skip the get_page call for unchanged pages.
+        """
+        page_id = extract_page_id(page_id)
+        with self._lock:
+            if page_id in self.synced_ids:
+                return
+            self.synced_ids.add(page_id)
+            self.visited_ids.add(page_id)
 
         indent = "  " * depth
 
-        # Get page metadata for title and last_edited_time
+        # Fast path: if the parent already told us the title and edit time,
+        # check whether the page changed before spending a get_page request.
+        if hint_edited_time and hint_title and self._is_unchanged(page_id, hint_edited_time):
+            title = hint_title or "Untitled"
+            safe_title = sanitize_filename(title)
+            last_edited = hint_edited_time
+
+            child_specs, _ = self._discover_children(
+                page_id, True, self.manifest.get_children(page_id))
+
+            if child_specs:
+                file_path = parent_dir / safe_title / "_index.md"
+            else:
+                file_path = parent_dir / f"{safe_title}.md"
+
+            rel_path = str(file_path.relative_to(self.output_dir))
+            with self._lock:
+                self._claim_path(page_id, rel_path)
+                print(f"{indent}[skip] {title}")
+                self.stats["skipped"] += 1
+                self.manifest.set(page_id, last_edited, rel_path)
+            self._checkpoint()
+            self._recurse_children(child_specs, parent_dir / safe_title, depth + 1)
+            return
+
+        # Full path: fetch page metadata (needed for properties / frontmatter)
         page = self.get_page(page_id)
         if not page:
             return
@@ -447,78 +683,60 @@ class NotionSync:
             title = "Untitled"
         safe_title = sanitize_filename(title)
 
-        # Discover children via blocks API — always do this even if page
-        # content is unchanged, because children may have changed independently.
-        child_pages, child_dbs = self._find_child_pages_and_dbs(page_id)
+        # Discover child pages/databases. For an unchanged page this reuses the
+        # child list recorded last run instead of walking the block tree again.
+        unchanged = self._is_unchanged(page_id, last_edited)
+        child_specs, walked = self._discover_children(
+            page_id, unchanged, self.manifest.get_children(page_id))
+        children_to_store = child_specs if walked else None
 
         # Determine file path
-        if child_pages or child_dbs:
-            page_dir = parent_dir / safe_title
-            file_path = page_dir / "_index.md"
+        if child_specs:
+            file_path = parent_dir / safe_title / "_index.md"
         else:
             file_path = parent_dir / f"{safe_title}.md"
 
         rel_path = str(file_path.relative_to(self.output_dir))
+        with self._lock:
+            self._claim_path(page_id, rel_path)
 
-        # Check if page is unchanged
-        if self._is_unchanged(page_id, last_edited):
-            print(f"{indent}[skip] {title}")
-            self.stats["skipped"] += 1
-            # Update manifest path in case parent structure changed
-            self.manifest.set(page_id, last_edited, rel_path)
-        else:
-            print(f"{indent}[page] {title}")
+            if unchanged:
+                print(f"{indent}[skip] {title}")
+                self.stats["skipped"] += 1
+                self.manifest.set(page_id, last_edited, rel_path, children_to_store)
+            else:
+                print(f"{indent}[page] {title}")
+                self._pending.append({
+                    "page_id": page_id,
+                    "file_path": file_path,
+                    "rel_path": rel_path,
+                    "props": props,
+                    "last_edited": last_edited,
+                    "children_to_store": children_to_store,
+                    "indent": indent,
+                })
 
-            # Get markdown content
-            md_data = self.get_page_markdown(page_id)
-            markdown = md_data.get("markdown", "") if md_data else ""
-            truncated = md_data.get("truncated", False) if md_data else False
-            unknown_ids = md_data.get("unknown_block_ids", []) if md_data else []
-
-            # Handle truncated pages: fetch unknown blocks
-            if truncated and unknown_ids:
-                print(f"{indent}  [truncated] fetching {len(unknown_ids)} additional blocks...")
-                for block_id in unknown_ids:
-                    block_md = self.get_page_markdown(block_id)
-                    if block_md and block_md.get("markdown"):
-                        markdown += "\n" + block_md["markdown"]
-
-            # Download images
-            markdown = self.process_images_in_markdown(markdown)
-
-            # Build frontmatter from properties (skip for pages with only title)
-            frontmatter = ""
-            non_title_props = {k: v for k, v in props.items() if v.get("type") != "title"}
-            if non_title_props:
-                frontmatter = properties_to_frontmatter(props)
-
-            if not self.dry_run:
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                content = frontmatter + markdown
-                file_path.write_text(content, encoding="utf-8")
-
-            self.manifest.set(page_id, last_edited, rel_path)
-            self.stats["pages"] += 1
+        self._checkpoint()
 
         # Always recurse into children
-        for block in child_pages:
-            child_id = block["id"]
-            self.sync_page(child_id, parent_dir / safe_title, depth + 1)
-
-        for block in child_dbs:
-            child_id = block["id"]
-            db_title = block.get("child_database", {}).get("title", "Untitled Database")
-            self.sync_database(child_id, parent_dir / safe_title, db_title, depth + 1)
+        self._recurse_children(child_specs, parent_dir / safe_title, depth + 1)
 
     def sync_database(self, database_id: str, parent_dir: Path, title: str = "", depth: int = 0):
         """Sync a database: create a directory, each row becomes a markdown file."""
         database_id = extract_page_id(database_id)
-        if database_id in self.synced_ids:
-            return
-        self.synced_ids.add(database_id)
-        self.visited_ids.add(database_id)
+        with self._lock:
+            if database_id in self.synced_ids:
+                return
+            self.synced_ids.add(database_id)
+            self.visited_ids.add(database_id)
 
         indent = "  " * depth
+
+        # A database previously found to be a linked view can't be queried; don't
+        # waste requests rediscovering that every run (--full re-checks).
+        if not self.full and self.manifest.is_linked_database(database_id):
+            print(f"{indent}[skip] linked database {title or database_id}")
+            return
 
         # Get database metadata for title if not provided
         if not title:
@@ -549,61 +767,106 @@ class NotionSync:
 
             last_edited = row.get("last_edited_time", "")
 
-            # Extract row title
             row_props = row.get("properties", {})
             row_title = "Untitled"
             for prop in row_props.values():
                 if prop.get("type") == "title":
-                    row_title = "".join(rt.get("plain_text", "") for rt in prop.get("title", []))
+                    row_title = "".join(
+                        rt.get("plain_text", "") for rt in prop.get("title", []))
                     break
             if not row_title:
                 row_title = "Untitled"
             safe_row_title = sanitize_filename(row_title)
 
-            # Check children for path determination
-            child_pages, child_dbs = self._find_child_pages_and_dbs(row_id)
+            unchanged = self._is_unchanged(row_id, last_edited)
+            child_specs, walked = self._discover_children(
+                row_id, unchanged, self.manifest.get_children(row_id))
+            children_to_store = child_specs if walked else None
 
-            if child_pages or child_dbs:
+            if child_specs:
                 file_path = db_dir / safe_row_title / "_index.md"
             else:
                 file_path = db_dir / f"{safe_row_title}.md"
 
             rel_path = str(file_path.relative_to(self.output_dir))
+            self._claim_path(row_id, rel_path)
 
-            # Check if row is unchanged
-            if self._is_unchanged(row_id, last_edited):
+            if unchanged:
                 print(f"{indent}  [skip] {row_title}")
                 self.stats["skipped"] += 1
-                self.manifest.set(row_id, last_edited, rel_path)
+                self.manifest.set(row_id, last_edited, rel_path, children_to_store)
             else:
                 print(f"{indent}  [row] {row_title}")
+                self._pending.append({
+                    "page_id": row_id,
+                    "file_path": file_path,
+                    "rel_path": rel_path,
+                    "props": row_props,
+                    "last_edited": last_edited,
+                    "children_to_store": children_to_store,
+                    "indent": indent + "  ",
+                })
 
-                # Get markdown content for this row
-                md_data = self.get_page_markdown(row_id)
-                markdown = md_data.get("markdown", "") if md_data else ""
-
-                # Download images
-                markdown = self.process_images_in_markdown(markdown)
-
-                # Properties as frontmatter
-                frontmatter = properties_to_frontmatter(row_props)
-
-                if not self.dry_run:
-                    file_path.parent.mkdir(parents=True, exist_ok=True)
-                    content = frontmatter + markdown
-                    file_path.write_text(content, encoding="utf-8")
-
-                self.manifest.set(row_id, last_edited, rel_path)
-                self.stats["pages"] += 1
-
-            # Always recurse into children
-            for block in child_pages:
-                self.sync_page(block["id"], db_dir / safe_row_title, depth + 2)
-            for block in child_dbs:
-                db_t = block.get("child_database", {}).get("title", "Untitled Database")
-                self.sync_database(block["id"], db_dir / safe_row_title, db_t, depth + 2)
+            self._checkpoint()
+            self._recurse_children(child_specs, db_dir / safe_row_title, depth + 2)
 
         self.stats["databases"] += 1
+
+    def _fetch_item(self, item: dict):
+        """Pass 2: fetch markdown content, download images, and write one file."""
+        page_id = item["page_id"]
+        file_path = item["file_path"]
+        indent = item["indent"]
+
+        md_data = self.get_page_markdown(page_id)
+        markdown = md_data.get("markdown", "") if md_data else ""
+        truncated = md_data.get("truncated", False) if md_data else False
+        unknown_ids = md_data.get("unknown_block_ids", []) if md_data else []
+
+        if truncated and unknown_ids:
+            print(f"{indent}  [truncated] fetching {len(unknown_ids)} additional blocks...")
+            for block_id in unknown_ids:
+                block_md = self.get_page_markdown(block_id)
+                if block_md and block_md.get("markdown"):
+                    markdown += "\n" + block_md["markdown"]
+
+        markdown = self.process_images_in_markdown(markdown)
+
+        props = item["props"]
+        frontmatter = ""
+        non_title_props = {k: v for k, v in props.items() if v.get("type") != "title"}
+        if non_title_props:
+            frontmatter = properties_to_frontmatter(props)
+
+        if not self.dry_run:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            content = frontmatter + markdown
+            file_path.write_text(content, encoding="utf-8")
+
+        with self._lock:
+            self.manifest.set(page_id, item["last_edited"], item["rel_path"],
+                              item["children_to_store"])
+            self.stats["pages"] += 1
+
+        self._checkpoint()
+
+    def _fetch_all_pending(self):
+        """Pass 2: fetch content for all discovered pages concurrently."""
+        if not self._pending:
+            return
+        print(f"\n[fetch] downloading content for {len(self._pending)} pages...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {pool.submit(self._fetch_item, item): item
+                       for item in self._pending}
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:
+                    item = futures[fut]
+                    print(f"  [error] fetch failed for {item['page_id']}: {e}")
+                    with self._lock:
+                        self.stats["errors"] += 1
+        self._pending.clear()
 
     def detect_and_sync(self, root_id: str, output_dir: Path, depth: int = 0):
         """Auto-detect whether root_id is a page or database and sync accordingly."""
@@ -626,39 +889,106 @@ class NotionSync:
         print(f"  [error] could not resolve ID: {rid}")
         self.stats["errors"] += 1
 
+    def _remove_local_file(self, rel_path: str, reason: str):
+        """Delete one tracked local file and prune parent dirs left empty."""
+        if self.dry_run or not rel_path:
+            return
+        full_path = self.output_dir / rel_path
+        if full_path.exists():
+            full_path.unlink()
+            print(f"[{reason}] {rel_path}")
+            self.stats["deleted"] += 1
+        parent = full_path.parent
+        while parent != self.output_dir:
+            try:
+                parent.rmdir()  # only removes if empty
+            except OSError:
+                break
+            parent = parent.parent
+
+    def _claim_path(self, page_id: str, rel_path: str):
+        """Record this page's current file path, and delete a stale file it left
+        at a previous path.
+
+        A page that was moved or renamed in Notion (or that gained/lost children,
+        switching between ``X.md`` and ``X/_index.md``) is written to its new
+        path but keeps the same id, so deletion detection never touches the old
+        file. Compare against the path recorded last run and remove it here.
+        """
+        prev_path = self.manifest.get_path(page_id)
+        if (prev_path and prev_path != rel_path
+                and prev_path not in self.claimed_paths):
+            self._remove_local_file(prev_path, "moved")
+        self.claimed_paths.add(rel_path)
+
     def _cleanup_deleted(self):
         """Remove local files for pages that no longer exist in Notion."""
         old_ids = self.manifest.all_ids()
         deleted_ids = old_ids - self.visited_ids
         for page_id in deleted_ids:
-            rel_path = self.manifest.get_path(page_id)
-            if rel_path:
-                full_path = self.output_dir / rel_path
-                if full_path.exists():
-                    full_path.unlink()
-                    print(f"[deleted] {rel_path}")
-                    self.stats["deleted"] += 1
-                # Clean up empty parent directories
-                parent = full_path.parent
-                while parent != self.output_dir:
-                    try:
-                        parent.rmdir()  # only removes if empty
-                    except OSError:
-                        break
-                    parent = parent.parent
+            self._remove_local_file(self.manifest.get_path(page_id), "deleted")
             self.manifest.remove(page_id)
 
-    def run(self, root_ids: list[str]):
-        """Sync all root pages/databases."""
+    def _extract_title(self, page: dict) -> str:
+        for prop in page.get("properties", {}).values():
+            if prop.get("type") == "title":
+                t = "".join(rt.get("plain_text", "") for rt in prop.get("title", []))
+                if t:
+                    return t
+        return "Untitled"
+
+    def run(self, root_ids: list[str] | None = None):
+        """Sync all root pages/databases.
+
+        If root_ids is empty or None, auto-discover workspace-level pages.
+        """
         if not self.dry_run:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-        for rid in root_ids:
-            self.detect_and_sync(rid, self.output_dir)
 
-        # Clean up pages that were deleted in Notion
-        if not self.dry_run:
-            self._cleanup_deleted()
-            self.manifest.save()
+        # Resolve roots
+        if root_ids:
+            resolved = [(extract_page_id(rid), None) for rid in root_ids]
+        else:
+            print("No roots configured — auto-discovering workspace-level pages...")
+            pages = self.search_root_pages()
+            resolved = [(p["id"], self._extract_title(p)) for p in pages]
+
+        print(f"\nRoot pages ({len(resolved)}):")
+        for rid, title in resolved:
+            if title:
+                print(f"  • {title}  ({rid})")
+            else:
+                page = self.get_page(rid)
+                name = self._extract_title(page) if page else rid
+                print(f"  • {name}  ({rid})")
+        print()
+
+        # Save whatever progress we have if the run is interrupted (Ctrl-C or a
+        # kill from a task runner), so the child-list cache built so far survives.
+        def _save_and_exit(signum, frame):
+            print("\n[interrupted] saving manifest before exit...")
+            if not self.dry_run:
+                self.manifest.save()
+            sys.exit(130)
+
+        old_handlers = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            old_handlers[sig] = signal.signal(sig, _save_and_exit)
+        try:
+            # Pass 1: discover tree structure (serial)
+            for rid, _ in resolved:
+                self.detect_and_sync(rid, self.output_dir)
+
+            # Pass 2: fetch content concurrently
+            self._fetch_all_pending()
+
+            # Clean up pages that were deleted in Notion
+            if not self.dry_run:
+                self._cleanup_deleted()
+                self.manifest.save()
+        finally:
+            for sig, handler in old_handlers.items():
+                signal.signal(sig, handler)
 
         print(f"\nDone: {self.stats['pages']} updated, {self.stats['skipped']} unchanged, "
               f"{self.stats['databases']} databases, {self.stats['images']} images, "
@@ -706,14 +1036,13 @@ def main():
         print(f"\n{'='*60}")
         print(f"Syncing workspace: {name}")
         print(f"Output: {output_dir}")
-        print(f"Roots: {len(roots)}")
         mode = "full" if args.full else "incremental"
         print(f"Mode: {mode}")
-        print(f"{'='*60}\n")
+        print(f"{'='*60}")
 
         syncer = NotionSync(token=token, output_dir=output_dir,
                             dry_run=args.dry_run, full=args.full)
-        syncer.run(roots)
+        syncer.run(roots or None)
 
 
 if __name__ == "__main__":

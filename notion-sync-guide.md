@@ -1,7 +1,7 @@
 # Notion Markdown API 同步指南
 
 用自己的脚本替代 notionfs，通过 Notion Markdown API 把 Notion 内容拉到本地 markdown。
-支持递归子页面、database、图片下载、双 workspace、Git 备份。
+支持递归子页面、database、图片下载、并发拉取、自适应限速、Git 备份。
 
 
 ## 文件清单
@@ -84,6 +84,8 @@ chmod +x notion_sync.py
 roots 里填你想同步的所有顶层页面和 database 的 URL（或 page ID）。
 脚本会自动检测每个 root 是 page 还是 database，并递归拉取所有子内容。
 
+如果不填 roots（留空数组 `[]` 或者去掉这个字段），脚本会通过 Search API 自动发现 workspace 里所有顶层页面。
+
 如何找到 page 或 database 的 URL：在 Notion 里打开页面，浏览器地址栏里的就是。
 
 
@@ -101,8 +103,13 @@ python3 notion_sync.py
 ============================================================
 Syncing workspace: personal
 Output: ./personal
-Roots: 3
+Mode: incremental
 ============================================================
+
+Root pages (3):
+  • 1-Projects  (3ce935f3-...)
+  • Notes  (abc123...)
+  • Reading List  (def456...)
 
 [page] 1-Projects
   [page] Project Alpha
@@ -117,17 +124,25 @@ Roots: 3
   [row] The Art of Statistics
   ...
 
+[fetch] downloading content for 18 pages...
+
 Done: 18 updated, 0 unchanged, 1 databases, 5 images, 0 deleted, 0 errors
 ```
+
+脚本分两个阶段工作：
+1. **Pass 1（发现）**：串行遍历整棵树，找到所有页面和数据库行，把需要拉内容的加入队列
+2. **Pass 2（拉取）**：用 3 个线程并发拉取 Markdown 内容、下载图片、写文件
 
 之后再次运行时，未修改的页面会被跳过：
 
 ```
 [skip] 1-Projects
   [skip] Project Alpha
-  [page] Project Beta           ← 这个改过了，重新拉取
+  [page] Project Beta           ← 这个改过了，加入队列
 [skip] Notes
   ...
+
+[fetch] downloading content for 1 pages...
 
 Done: 1 updated, 16 unchanged, 1 databases, 0 images, 0 deleted, 0 errors
 ```
@@ -195,7 +210,7 @@ cd ~/notion-sync
 ```
 
 sync.sh 会：
-1. 跑 notion_sync.py 增量拉取两个 workspace 的变化内容
+1. 跑 notion_sync.py 增量拉取变化内容（并发 + 自适应限速）
 2. 对每个 workspace 目录做 git add、commit、push
 
 只同步某个 workspace：
@@ -259,6 +274,18 @@ EOF
 如果你想更安全，可以用环境变量替代 config.json 里的 token 值。
 在 config.json 里写 "$NOTION_TOKEN_PERSONAL"，然后在 shell 里 export。
 （需要小改 notion_sync.py 的 load_config 函数来做环境变量替换。）
+
+
+## 性能
+
+脚本使用两阶段架构 + 3 线程并发 + 自适应限速器（默认 4 req/s，遇到 429 自动降速，成功后恢复）。
+
+粗略估算（~1600 页的 workspace）：
+- 首次全量同步：~4500 次 API 请求，约 20-25 分钟
+- 增量同步（无变化）：~1600 次请求（只查元数据），约 7 分钟
+- 增量同步（少量变化）：和上面差不多，每个变化的页面多 1 次请求
+
+Manifest 每 20 秒自动保存一次，Ctrl-C 中断时也会保存，下次从中断处继续。
 
 
 ## Markdown API 的已知限制
