@@ -46,6 +46,11 @@ RATE_LIMIT_DELAY = 0.2  # seconds between requests; 429s are retried with backof
 MANIFEST_FILE = ".manifest.json"
 MAX_WORKERS = 3
 RATE_LIMIT_RPS = 4  # max requests per second across all threads
+REQUEST_TIMEOUT = (10, 60)  # (connect, read) seconds — prevents a stalled socket hanging forever
+
+
+class SyncAbort(Exception):
+    """Fatal condition (bad token, nothing visited): stop immediately, skip cleanup."""
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +324,8 @@ class NotionSync:
         self.changes: list[tuple[str, str]] = []  # (tag, description)
         self._checkpoint_interval = 20.0  # seconds between incremental manifest saves
         self._last_checkpoint = time.time()
-        self._lock = threading.Lock()  # protects stats, manifest, synced/visited/claimed
+        # Reentrant: _claim_path → _move_local_file re-acquires it while the caller holds it.
+        self._lock = threading.RLock()  # protects stats, manifest, synced/visited/claimed
         self._rate_limiter = TokenBucket(RATE_LIMIT_RPS)
         self._pending: list[dict] = []  # work items deferred to the concurrent fetch pass
         self._edit_times: dict[str, str] = {}  # page_id → last_edited_time from Search prefetch
@@ -339,13 +345,16 @@ class NotionSync:
         for attempt in range(5):
             self._rate_limiter.acquire()
             try:
-                resp = self.session.request(method, url, **kwargs)
+                resp = self.session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
                 if resp.status_code == 429:
                     retry_after = float(resp.headers.get("Retry-After", 2))
                     self._rate_limiter.throttle()
                     print(f"  [rate limited] waiting {retry_after}s (attempt {attempt + 1}/5)...")
                     time.sleep(retry_after)
                     continue
+                if resp.status_code == 401:
+                    raise SyncAbort(f"401 Unauthorized for {url} — "
+                                    f"token is missing, invalid, or expired")
                 if resp.status_code == 404:
                     print(f"  [404] not found: {url}")
                     with self._lock:
@@ -354,12 +363,20 @@ class NotionSync:
                 resp.raise_for_status()
                 self._rate_limiter.recover()
                 return resp.json()
+            except (requests.Timeout, requests.ConnectionError) as e:
+                # Transient network failure: retry rather than return None, since a
+                # missing child listing would make cleanup delete local files.
+                wait = 2 ** attempt
+                print(f"  [network] {type(e).__name__}, retrying in {wait}s "
+                      f"(attempt {attempt + 1}/5)...")
+                time.sleep(wait)
+                continue
             except requests.RequestException as e:
                 print(f"  [error] {e}")
                 with self._lock:
                     self.stats["errors"] += 1
                 return None
-        print(f"  [error] gave up after repeated rate limiting: {url}")
+        print(f"  [error] gave up after repeated rate limiting / network errors: {url}")
         with self._lock:
             self.stats["errors"] += 1
         return None
@@ -653,6 +670,8 @@ class NotionSync:
                 for fut in as_completed(futures):
                     try:
                         fut.result()
+                    except SyncAbort:
+                        raise
                     except Exception as e:
                         spec = futures[fut]
                         print(f"  [error] sync_page failed for {spec['id']}: {e}")
@@ -825,10 +844,11 @@ class NotionSync:
 
         for row in rows:
             row_id = row["id"]
-            if row_id in self.synced_ids:
-                continue
-            self.synced_ids.add(row_id)
-            self.visited_ids.add(row_id)
+            with self._lock:
+                if row_id in self.synced_ids:
+                    continue
+                self.synced_ids.add(row_id)
+                self.visited_ids.add(row_id)
 
             last_edited = row.get("last_edited_time", "")
 
@@ -854,29 +874,31 @@ class NotionSync:
                 file_path = db_dir / f"{safe_row_title}.md"
 
             rel_path = str(file_path.relative_to(self.output_dir))
-            needs_refetch = self._claim_path(row_id, rel_path)
+            with self._lock:
+                needs_refetch = self._claim_path(row_id, rel_path)
 
-            if unchanged and not needs_refetch:
-                print(f"{indent}  [skip] {row_title}")
-                self.stats["skipped"] += 1
-                self.manifest.set(row_id, last_edited, rel_path, children_to_store)
-            else:
-                print(f"{indent}  [row] {row_title}")
-                self._pending.append({
-                    "page_id": row_id,
-                    "file_path": file_path,
-                    "rel_path": rel_path,
-                    "props": row_props,
-                    "last_edited": last_edited,
-                    "children_to_store": children_to_store,
-                    "indent": indent + "  ",
-                })
+                if unchanged and not needs_refetch:
+                    print(f"{indent}  [skip] {row_title}")
+                    self.stats["skipped"] += 1
+                    self.manifest.set(row_id, last_edited, rel_path, children_to_store)
+                else:
+                    print(f"{indent}  [row] {row_title}")
+                    self._pending.append({
+                        "page_id": row_id,
+                        "file_path": file_path,
+                        "rel_path": rel_path,
+                        "props": row_props,
+                        "last_edited": last_edited,
+                        "children_to_store": children_to_store,
+                        "indent": indent + "  ",
+                    })
 
             self._checkpoint()
             self._recurse_children(child_specs, db_dir / safe_row_title, depth + 2,
                                    from_cache=not walked)
 
-        self.stats["databases"] += 1
+        with self._lock:
+            self.stats["databases"] += 1
 
     def _fetch_item(self, item: dict):
         """Pass 2: fetch markdown content, download images, and write one file."""
@@ -928,6 +950,8 @@ class NotionSync:
             for fut in as_completed(futures):
                 try:
                     fut.result()
+                except SyncAbort:
+                    raise
                 except Exception as e:
                     item = futures[fut]
                     print(f"  [error] fetch failed for {item['page_id']}: {e}")
@@ -1084,6 +1108,10 @@ class NotionSync:
             for rid, _ in resolved:
                 self.detect_and_sync(rid, self.output_dir)
 
+            if not self.visited_ids:
+                raise SyncAbort("no pages or databases were visited — refusing to "
+                                "continue (cleanup would delete every local file)")
+
             # Pass 2: fetch content concurrently
             self._fetch_all_pending()
 
@@ -1161,7 +1189,11 @@ def main():
 
         syncer = NotionSync(token=token, output_dir=output_dir,
                             dry_run=args.dry_run, full=args.full)
-        syncer.run(roots or None)
+        try:
+            syncer.run(roots or None)
+        except SyncAbort as e:
+            print(f"\n[abort] {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
